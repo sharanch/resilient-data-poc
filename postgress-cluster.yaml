@@ -1,0 +1,31 @@
+# Install the CNPG operator (v1.25.1)
+#kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+
+
+
+
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: my-pg-cluster
+spec:
+  instances: 3  # 1 Primary + 2 Replicas
+  
+  # Image for the DB
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.2
+  
+  # Storage configuration (Dynamic PV)
+  storage:
+    size: 1Gi
+    storageClass: standard # Standard for Minikube
+
+  # The Initial Database
+  bootstrap:
+    initdb:
+      database: app_db
+      owner: app_user
+
+  # SRE Best Practice: Monitoring
+  monitoring:
+    enablePodMonitor: true
