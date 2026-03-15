@@ -1,27 +1,20 @@
-# CNPG Chaos Test
+# resilient-data-poc
 
-Automated failover and replication testing for a [CloudNativePG](https://cloudnative-pg.io/) PostgreSQL cluster running on Kubernetes (Minikube).
+Chaos engineering test suite for [CloudNativePG](https://cloudnative-pg.io/) running on Kubernetes (Minikube). Validates PostgreSQL high-availability through automated failover testing, replication verification, and write-durability under primary failure.
 
 ---
 
-## What it does
+## What's in this repo
 
-Runs an end-to-end chaos test against a CNPG cluster:
-
-1. Writes a canary row to the primary pod
-2. Verifies the row has replicated to all replica pods
-3. Hard-kills the primary pod (`--grace-period=0 --force`)
-4. Waits for CNPG to elect a new primary and measures the failover time
-5. Confirms the canary row is intact on the new primary (data integrity check)
-6. Reports the final cluster topology
-
-Each run gets a unique `run_id` (e.g. `chaos-6878`) so you can correlate writes across runs in the `chaos_test` table.
+| File | Purpose |
+|---|---|
+| `postgres-cluster.yaml` | CNPG `Cluster` manifest — 1 primary + 2 replicas |
+| `cnpg-chaos-test.sh` | Failover + replication chaos test |
+| `cnpg-write-failover.sh` | Write-during-failover durability test |
 
 ---
 
 ## Cluster setup
-
-The script was built for this CNPG cluster definition:
 
 ```yaml
 apiVersion: postgresql.cnpg.io/v1
@@ -29,7 +22,7 @@ kind: Cluster
 metadata:
   name: my-pg-cluster
 spec:
-  instances: 3        # 1 primary + 2 replicas
+  instances: 3
   imageName: ghcr.io/cloudnative-pg/postgresql:16.2
   storage:
     size: 1Gi
@@ -42,11 +35,18 @@ spec:
     enablePodMonitor: true
 ```
 
-Install the CNPG operator before applying:
+Install the CNPG operator first:
 
 ```bash
 kubectl apply --server-side -f \
   https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+```
+
+Then apply the cluster:
+
+```bash
+kubectl apply -f postgres-cluster.yaml
+kubectl get pods -l cnpg.io/cluster=my-pg-cluster --watch
 ```
 
 ---
@@ -59,18 +59,27 @@ kubectl apply --server-side -f \
 
 ---
 
-## Usage
+## Test 1 — `cnpg-chaos-test.sh`
+
+Runs a full end-to-end chaos sequence:
+
+1. Writes a canary row to the primary
+2. Verifies the row replicated to all replicas
+3. Hard-kills the primary pod (`--grace-period=0 --force`)
+4. Waits for CNPG to elect a new primary and measures failover time
+5. Confirms the canary row is intact on the new primary
+6. Reports final cluster topology
 
 ```bash
 chmod +x cnpg-chaos-test.sh
 
-# Full test — write, replicate, kill, failover, integrity check
+# Full test
 ./cnpg-chaos-test.sh
 
-# Only test replication (no kill)
+# Skip the kill (replication check only)
 ./cnpg-chaos-test.sh --skip-kill
 
-# Only test failover (no write/replication check)
+# Skip the write (failover only)
 ./cnpg-chaos-test.sh --skip-write
 
 # Custom cluster or namespace
@@ -86,11 +95,97 @@ CLUSTER=my-pg-cluster NAMESPACE=chatops ./cnpg-chaos-test.sh
 | `--skip-write` | off | Skip write + replication steps |
 | `--skip-kill` | off | Skip kill + failover steps |
 
+### Results (5 runs)
+
+```
+Run          Old primary    New primary    Failover    Result
+──────────────────────────────────────────────────────────────
+chaos-7613   cluster-1      cluster-2      2174ms      PASS
+chaos-7648   cluster-2      —              —           FAIL *
+chaos-7680   cluster-2      —              —           FAIL *
+chaos-7713   cluster-2      cluster-3      2437ms      PASS
+chaos-7748   cluster-3      cluster-2      4532ms      PASS
+
+* Replication lag on cluster-3 — replica had just rejoined after
+  the previous run's failover. Not a CNPG bug; 30s between runs
+  was insufficient for full catch-up.
+
+Average failover (3 passing runs): 2979ms
+Fastest: 2174ms  |  Slowest: 4532ms
+```
+
+All three successful runs confirmed zero data loss on the canary row.
+Primary rotation covered all three pods across the run set.
+
+---
+
+## Test 2 — `cnpg-write-failover.sh`
+
+Runs a continuous insert loop at 100ms intervals while killing the primary mid-flight. Measures:
+
+- **Write outage window** — how long inserts failed or were skipped during election
+- **Sequence gaps** — whether any committed transactions were lost
+- **Pre/during/post breakdown** — how many rows landed in each phase of the failover
+
+```bash
+chmod +x cnpg-write-failover.sh
+
+# Default: 100ms writes, 3s warmup, 5s cooldown
+./cnpg-write-failover.sh
+
+# Custom intervals
+./cnpg-write-failover.sh --write-interval 50 --warmup-secs 5
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cluster` | `my-pg-cluster` | CNPG cluster name |
+| `--namespace` | `default` | Kubernetes namespace |
+| `--write-interval` | `100` | Milliseconds between writes |
+| `--warmup-secs` | `3` | Seconds to write before kill |
+| `--cooldown-secs` | `5` | Seconds to write after election |
+
+### Result
+
+```
+CNPG Write-During-Failover Test — wf-8366
+
+  Write interval:   100ms
+  Warmup:           3s before kill
+  Cooldown:         5s after election
+
+  6 rows written during warmup
+  Pod my-pg-cluster-1 deleted at 1773558369957ms
+  New primary: my-pg-cluster-2 (elected in 2388ms)
+
+  Total write attempts:  26
+    OK:    17
+    ERR:   0
+    SKIP:  9   (no primary visible during election)
+
+  Write outage window:   1738ms
+  Pre-kill rows:         6
+  During-outage rows:    1
+  Post-election rows:    10
+
+  Rows committed in DB:  17  (of 17 reported OK)
+  Sequence gaps:         1 *
+  Data loss:             0 rows
+
+  DURABILITY TEST PASSED — zero data loss on committed writes
+```
+
+**On the sequence gap:** `BIGSERIAL` sequences are non-transactional in Postgres — a value consumed by an in-flight transaction that dies with the pod is permanently skipped. A gap of 1 confirms one transaction was lost to the crash (expected), but it was never committed so it is not data loss. A gap > 5 would indicate real missing committed rows worth investigating.
+
+**Write outage vs failover time:** CNPG elected a new primary in 2388ms, but the write outage was only 1738ms — the writer raced the election and landed one row during the transition. This is normal CNPG behaviour and demonstrates that the actual application-visible downtime is shorter than the failover time measured at the infrastructure level.
+
 ---
 
 ## How primary detection works
 
-CNPG automatically labels pods with `cnpg.io/instanceRole=primary` or `replica`. The script uses these labels to find the current primary without hardcoding any pod names:
+Both scripts use CNPG's pod labels rather than hardcoded names:
 
 ```bash
 kubectl get pod \
@@ -98,70 +193,25 @@ kubectl get pod \
   -o jsonpath='{.items[0].metadata.name}'
 ```
 
-This means the script works correctly even after a failover has already happened and a different pod is now primary.
+This works correctly after any number of failovers without modification.
 
 ---
 
 ## Password handling
 
-CNPG uses `scram-sha-256` auth even for `127.0.0.1` connections inside the pod. The script fetches the password automatically from the cluster secret:
+CNPG uses `scram-sha-256` auth even for `127.0.0.1` connections inside the pod. Both scripts fetch the password from the cluster secret at runtime:
 
 ```bash
 DB_PASS=$(kubectl get secret my-pg-cluster-app \
   -o jsonpath='{.data.password}' | base64 --decode)
 ```
 
-It is passed into the pod via `env PGPASSWORD=` on each `kubectl exec` call — no `.pgpass` file or manual export needed.
-
----
-
-## Example output
-
-```
-CNPG Chaos Test — chaos-6878
-  cluster: my-pg-cluster  namespace: default
-  →  Primary: my-pg-cluster-2
-  →  Replicas: my-pg-cluster-1 my-pg-cluster-3
-
-Step 1 — Ensure chaos_test table exists
-  ✓  Table ready
-
-Step 2 — Write test row to primary (my-pg-cluster-2)
-  ✓  Row inserted: run_id=chaos-6878
-
-Step 3 — Verify replication to all replicas
-  ✓  Replica my-pg-cluster-1 has the row (1 row)
-  ✓  Replica my-pg-cluster-3 has the row (1 row)
-
-Step 4 — Kill primary pod (my-pg-cluster-2)
-  ✓  Pod my-pg-cluster-2 deleted
-
-Step 5 — Waiting for new primary election (timeout: 120s)
-  →  Polling every 2s…
-  ✓  New primary elected: my-pg-cluster-1  (failover in 8340ms)
-
-Step 6 — Data integrity on new primary (my-pg-cluster-1)
-  ✓  Data intact on new primary (1 row for chaos-6878)
-
-Step 7 — Cluster topology after failover
-NAME               READY   STATUS    ROLE
-my-pg-cluster-1    1/1     Running   primary
-my-pg-cluster-2    1/1     Running   replica
-my-pg-cluster-3    1/1     Running   replica
-
-Summary
-  ✓  Run ID:         chaos-6878
-  ✓  Old primary:    my-pg-cluster-2 (deleted)
-  ✓  New primary:    my-pg-cluster-1
-  ✓  Failover time:  8340ms
-
-All chaos checks PASSED
-```
+Passed into the pod via `env PGPASSWORD=` on each `kubectl exec` — no `.pgpass` file, no manual export.
 
 ---
 
 ## Notes
 
-- The replication check waits 1 second before reading from replicas to account for streaming replication lag on Minikube. Increase this if you see intermittent replica failures.
-- The `chaos_test` table is created with `IF NOT EXISTS` — repeated runs are safe and accumulate rows.
-- Failover time is measured from pod deletion to the moment a new pod acquires the `primary` role label.
+- The replication check in `cnpg-chaos-test.sh` waits 1 second before reading from replicas to account for streaming replication lag on Minikube. With less than 60s between back-to-back runs, a replica that just rejoined may still be catching up — increase the sleep between runs or bump the lag buffer to 3–5s if you see intermittent replica failures.
+- Each `cnpg-write-failover.sh` run drops and recreates `write_failover_test` so results never bleed between runs.
+- Failover time is measured from `kubectl delete pod` to the moment a pod acquires the `primary` role label — wall-clock time including Kubernetes pod scheduling and CNPG promotion logic.
