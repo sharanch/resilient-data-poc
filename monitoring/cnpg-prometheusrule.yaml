@@ -1,0 +1,46 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cnpg-alerts
+  namespace: default
+  labels:
+    release: prom-stack
+spec:
+  groups:
+    - name: cnpg.failover
+      interval: 10s
+      rules:
+
+        - alert: CNPGInstanceDown
+          expr: |
+            count by (cluster) (
+              cnpg_collector_up{cluster="my-pg-cluster"} == 1
+            ) < 4
+          for: 10s
+          labels:
+            severity: critical
+          annotations:
+            summary: "CNPG cluster {{ $labels.cluster }} has a down instance"
+            description: >
+              Only {{ $value }} instance(s) reporting up. A failover is
+              likely in progress.
+
+        - alert: CNPGReplicationLagHigh
+          expr: |
+            cnpg_pg_replication_lag{cluster="my-pg-cluster"} > 5
+          for: 20s
+          labels:
+            severity: warning
+          annotations:
+            summary: "CNPG replication lag high on {{ $labels.pod }}"
+            description: "Replica {{ $labels.pod }} is {{ $value }}s behind."
+
+        - alert: CNPGWriteLagHigh
+          expr: |
+            cnpg_pg_stat_replication_write_lag_seconds{cluster="my-pg-cluster"} > 2
+          for: 20s
+          labels:
+            severity: warning
+          annotations:
+            summary: "CNPG write lag high on {{ $labels.pod }}"
+            description: "Write lag on {{ $labels.pod }} is {{ $value }}s."
