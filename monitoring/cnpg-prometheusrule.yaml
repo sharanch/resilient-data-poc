@@ -7,6 +7,8 @@ metadata:
     release: prom-stack
 spec:
   groups:
+
+    # ── Alerting rules ─────────────────────────────────────────────────────────
     - name: cnpg.failover
       interval: 10s
       rules:
@@ -22,8 +24,8 @@ spec:
           annotations:
             summary: "CNPG cluster {{ $labels.cluster }} has a down instance"
             description: >
-              Only {{ $value }} instance(s) reporting up. A failover is
-              likely in progress.
+              Only {{ $value }} instance(s) reporting up. Expected 3.
+              A failover is likely in progress.
 
         - alert: CNPGReplicationLagHigh
           expr: |
@@ -33,7 +35,7 @@ spec:
             severity: warning
           annotations:
             summary: "CNPG replication lag high on {{ $labels.pod }}"
-            description: "Replica {{ $labels.pod }} is {{ $value }}s behind."
+            description: "Replica {{ $labels.pod }} is {{ $value }}s behind the primary."
 
         - alert: CNPGWriteLagHigh
           expr: |
@@ -43,4 +45,120 @@ spec:
             severity: warning
           annotations:
             summary: "CNPG write lag high on {{ $labels.pod }}"
-            description: "Write lag on {{ $labels.pod }} is {{ $value }}s."
+            description: "Write lag on {{ $labels.pod }} is {{ $value }}s. Threshold: 2s."
+
+    # ── Error budget recording rules ───────────────────────────────────────────
+    # SLO: 99.9% availability (allows 43.2 minutes downtime per 30 days)
+    # A pod is "available" when cnpg_collector_up == 1
+    # Downtime = any scrape interval where at least one pod is not up
+
+    - name: cnpg.slo
+      interval: 30s
+      rules:
+
+        # Availability ratio over the last 30 days
+        # 1.0 = fully available, 0.999 = 99.9% available
+        - record: cnpg:availability_ratio:30d
+          expr: |
+            avg_over_time(
+              (
+                count(cnpg_collector_up{cluster="my-pg-cluster"} == 1) /
+                count(cnpg_collector_up{cluster="my-pg-cluster"})
+              )[30d:30s]
+            )
+
+        # Availability ratio over the last 1 hour (short window for burn rate)
+        - record: cnpg:availability_ratio:1h
+          expr: |
+            avg_over_time(
+              (
+                count(cnpg_collector_up{cluster="my-pg-cluster"} == 1) /
+                count(cnpg_collector_up{cluster="my-pg-cluster"})
+              )[1h:30s]
+            )
+
+        # Error budget remaining as a fraction (0.0 = fully consumed, 1.0 = full)
+        # SLO target = 0.999 (99.9%)
+        # Error budget = 1 - 0.999 = 0.001
+        # Remaining = (availability - SLO target) / error budget
+        - record: cnpg:error_budget_remaining:fraction
+          expr: |
+            (cnpg:availability_ratio:30d - 0.999) / 0.001
+
+        # Error budget remaining as a percentage (100 = full, 0 = exhausted)
+        - record: cnpg:error_budget_remaining:percent
+          expr: |
+            cnpg:error_budget_remaining:fraction * 100
+
+        # Burn rate — how fast you are consuming the error budget right now
+        # 1.0 = consuming at exactly the rate that exhausts budget in 30 days
+        # > 1.0 = burning faster than sustainable
+        # > 14.4 = will exhaust budget in 2 hours (fast burn — page immediately)
+        - record: cnpg:error_budget_burn_rate:1h
+          expr: |
+            (1 - cnpg:availability_ratio:1h) / 0.001
+
+    # ── Error budget alerts ────────────────────────────────────────────────────
+    - name: cnpg.error_budget
+      interval: 30s
+      rules:
+
+        # Fast burn — losing budget 14.4x faster than sustainable
+        # Will exhaust entire monthly budget in ~2 hours if not addressed
+        - alert: CNPGErrorBudgetFastBurn
+          expr: |
+            cnpg:error_budget_burn_rate:1h > 14.4
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CNPG error budget fast burn — {{ $value | humanize }}x rate"
+            description: >
+              Cluster my-pg-cluster is burning error budget at {{ $value | humanize }}x
+              the sustainable rate. At this rate the entire monthly budget
+              (43.2 minutes) will be exhausted in ~2 hours.
+              Immediate investigation required.
+
+        # Slow burn — losing budget 3x faster than sustainable
+        # Will exhaust budget in ~10 days if not addressed
+        - alert: CNPGErrorBudgetSlowBurn
+          expr: |
+            cnpg:error_budget_burn_rate:1h > 3
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CNPG error budget slow burn — {{ $value | humanize }}x rate"
+            description: >
+              Cluster my-pg-cluster is burning error budget at {{ $value | humanize }}x
+              the sustainable rate. At this rate the monthly budget will be
+              exhausted in ~10 days.
+
+        # Budget low — less than 10% of monthly budget remaining
+        - alert: CNPGErrorBudgetLow
+          expr: |
+            cnpg:error_budget_remaining:percent < 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CNPG error budget below 10%"
+            description: >
+              Only {{ $value | humanize }}% of the monthly error budget remains
+              for cluster my-pg-cluster. SLO target: 99.9%.
+              Budget = 43.2 minutes downtime per 30 days.
+
+        # Budget exhausted — SLO is breached
+        - alert: CNPGErrorBudgetExhausted
+          expr: |
+            cnpg:error_budget_remaining:percent <= 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CNPG error budget exhausted — SLO breached"
+            description: >
+              Cluster my-pg-cluster has exhausted its monthly error budget.
+              The 99.9% availability SLO has been breached.
+              Remaining: {{ $value | humanize }}%.
+              
