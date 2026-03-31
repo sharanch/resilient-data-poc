@@ -1,35 +1,59 @@
 # resilient-data-poc
 
-Chaos engineering test suite for [CloudNativePG](https://cloudnative-pg.io/) running on Kubernetes (Minikube). Validates PostgreSQL high-availability through automated failover testing, replication verification, write-durability under primary failure, and live observability with Prometheus + Grafana.
+Chaos engineering and SRE observability lab for [CloudNativePG](https://cloudnative-pg.io/) running on Kubernetes (Minikube). Covers automated failover testing, replication verification, write-durability under primary failure, Prometheus alerting, error budget tracking, and a custom Grafana SLO dashboard.
 
 ---
 
-## Overview
+## SLI / SLO / Error Budget
 
-| Component | Details |
-|---|---|
-| Platform | Kubernetes (Minikube) |
-| Database | PostgreSQL 16.2 via CloudNativePG |
-| Cluster topology | 1 primary + 2 replicas |
-| Observability | Prometheus + Grafana (kube-prometheus-stack) |
-| Measured RTO | 2.2 – 4.5 seconds |
-| Data loss on failover | Zero |
+| SLI | SLO target | Measured | Status |
+|---|---|---|---|
+| Instance availability | 99.9% per 30 days | 100% at steady state | Met |
+| Failover time (RTO) | < 10s | 2.2 – 4.5s | Met |
+| Replication lag | < 5s | 0s at steady state | Met |
+| Write lag | < 2s | 0s at steady state | Met |
+| Data loss on failover | 0 rows | 0 rows | Met |
+
+**Error budget:** 99.9% SLO = 43.2 minutes downtime allowed per 30 days = ~86 unplanned failovers at ~30s downtime per event.
 
 ---
 
-## What's in this repo
+## Screenshots
+
+**Failover captured live — cluster mid-election:**
+
+![Grafana failover mid-flight](docs/screenshots/grafana-failover-mid-flight.png)
+
+**Cluster fully recovered after failover:**
+
+![Grafana cluster healthy](docs/screenshots/grafana-cluster-healthy.png)
+
+**SLO dashboard — error budget exhausted after chaos loop:**
+
+![Grafana SLO budget breached](docs/screenshots/grafana-slo-budget-breached.png)
+
+**Prometheus alerts firing — budget exhausted:**
+
+![Prometheus budget alerts firing](docs/screenshots/prometheus-budget-alerts-firing.png)
+
+---
+
+## Repo structure
 
 ```
 .
-├── postgres-cluster.yaml          # CNPG Cluster manifest
-├── cnpg-chaos-test.sh             # Failover + replication chaos test
-├── cnpg-write-failover.sh         # Write-during-failover durability test
+├── postgres-cluster.yaml              # CNPG Cluster manifest
+├── cnpg-chaos-test.sh                 # Failover + replication chaos test
+├── cnpg-write-failover.sh             # Write-during-failover durability test
 ├── monitoring/
-│   ├── setup-monitoring.sh        # Installs kube-prometheus-stack via Helm
+│   ├── setup-monitoring.sh            # Installs kube-prometheus-stack via Helm
 │   ├── kube-prometheus-stack-values.yaml
-│   └── README.md                  # Monitoring setup docs
+│   ├── setup-alerts.sh                # Applies PrometheusRule and verifies alerts
+│   ├── cnpg-prometheusrule.yaml       # Alert + error budget recording rules
+│   ├── cnpg-slo-dashboard.json        # Custom Grafana SLO & error budget dashboard
+│   └── README.md
 └── docs/
-    └── screenshots/               # Grafana dashboard captures
+    └── screenshots/
 ```
 
 ---
@@ -52,7 +76,7 @@ spec:
       database: app_db
       owner: app_user
   monitoring:
-    enablePodMonitor: true
+    enablePodMonitor: true   # exposes metrics for Prometheus scraping
 ```
 
 Install the CNPG operator first:
@@ -60,11 +84,7 @@ Install the CNPG operator first:
 ```bash
 kubectl apply --server-side -f \
   https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
-```
 
-Apply the cluster:
-
-```bash
 kubectl apply -f postgres-cluster.yaml
 kubectl get pods -l cnpg.io/cluster=my-pg-cluster --watch
 ```
@@ -73,26 +93,15 @@ kubectl get pods -l cnpg.io/cluster=my-pg-cluster --watch
 
 ## Test 1 — Failover + replication (`cnpg-chaos-test.sh`)
 
-Runs a full end-to-end chaos sequence:
-
-1. Writes a canary row to the primary
-2. Verifies the row replicated to all replicas
-3. Hard-kills the primary pod (`--grace-period=0 --force`)
-4. Waits for CNPG to elect a new primary and measures failover time
-5. Confirms the canary row is intact on the new primary
-6. Reports final cluster topology
+Writes a canary row to the primary, verifies replication to all replicas, hard-kills the primary, waits for election, and confirms data integrity on the new primary.
 
 ```bash
 chmod +x cnpg-chaos-test.sh
 
-# Full test
-./cnpg-chaos-test.sh
-
-# Replication check only (no kill)
-./cnpg-chaos-test.sh --skip-kill
-
-# Failover only (no write)
-./cnpg-chaos-test.sh --skip-write
+./cnpg-chaos-test.sh                          # full test
+./cnpg-chaos-test.sh --skip-kill              # replication check only
+./cnpg-chaos-test.sh --skip-write             # failover only
+CLUSTER=my-pg-cluster NAMESPACE=chatops ./cnpg-chaos-test.sh
 ```
 
 ### Options
@@ -115,33 +124,26 @@ chaos-7680   cluster-2      —              —           FAIL *
 chaos-7713   cluster-2      cluster-3      2437ms      PASS
 chaos-7748   cluster-3      cluster-2      4532ms      PASS
 
-* Replication lag on cluster-3 — replica had just rejoined after
-  the previous run's failover. Not a CNPG bug; 30s between runs
-  was insufficient for full replica catch-up.
+* Replication lag on cluster-3 — replica still catching up after
+  previous failover. Not a CNPG bug; 30s between runs was
+  insufficient for full replica rejoin.
 
 Average failover (3 passing runs): 2979ms
 Fastest: 2174ms  |  Slowest: 4532ms
 ```
 
-All three successful runs confirmed zero data loss on the canary row. Primary rotation covered all three pods across the run set.
+Zero data loss confirmed on all passing runs. Primary rotation covered all three pods.
 
 ---
 
 ## Test 2 — Write-during-failover (`cnpg-write-failover.sh`)
 
-Runs a continuous insert loop at 100ms intervals while killing the primary mid-flight. Measures:
-
-- **Write outage window** — how long inserts failed or were skipped during election
-- **Sequence gaps** — whether any committed transactions were lost
-- **Pre/during/post breakdown** — how many rows landed in each phase
+Runs a continuous insert loop at 100ms intervals while killing the primary mid-flight. Measures write outage window, sequence gaps, and pre/during/post row counts.
 
 ```bash
 chmod +x cnpg-write-failover.sh
 
-# Default: 100ms writes, 3s warmup, 5s cooldown
 ./cnpg-write-failover.sh
-
-# Custom intervals
 ./cnpg-write-failover.sh --write-interval 50 --warmup-secs 5
 ```
 
@@ -159,9 +161,7 @@ chmod +x cnpg-write-failover.sh
 
 ```
 Total write attempts:  26
-  OK:    17
-  ERR:   0
-  SKIP:  9   (no primary visible during election)
+  OK:    17  |  ERR: 0  |  SKIP: 9 (no primary during election)
 
 Write outage window:   1738ms
 Pre-kill rows:         6
@@ -175,50 +175,105 @@ Data loss:             0 rows
 DURABILITY TEST PASSED — zero data loss on committed writes
 ```
 
-**On the sequence gap:** `BIGSERIAL` sequences are non-transactional in Postgres — a value consumed by an in-flight transaction that dies with the pod is permanently skipped. A gap of 1 confirms one transaction was lost to the crash (expected and correct), but it was never committed so it is not data loss. A gap > 5 would indicate real missing committed rows.
+**On the sequence gap:** `BIGSERIAL` sequences are non-transactional — a value consumed by an in-flight transaction that dies with the pod is permanently skipped. A gap of 1 is expected and correct. A gap > 5 would indicate real missing committed rows.
 
-**Write outage vs failover time:** CNPG elected a new primary in 2388ms, but the application-level write outage was only 1738ms — the writer raced the election and landed one row during the transition. This demonstrates that application-visible downtime is shorter than infrastructure-level failover time.
+**Write outage vs failover time:** CNPG elected a new primary in 2388ms but the write outage was only 1738ms — the writer raced the election and landed one row during the transition. Application-visible downtime is shorter than infrastructure-level failover time.
 
 ---
 
-## Observability — Prometheus + Grafana
+## Observability
 
-The cluster runs with `monitoring.enablePodMonitor: true`, exposing metrics that are scraped by Prometheus and visualized in Grafana via the official CNPG dashboard.
-
-See [`monitoring/README.md`](monitoring/README.md) for full setup instructions.
-
-### Install
+### Install Prometheus + Grafana
 
 ```bash
 chmod +x monitoring/setup-monitoring.sh
 ./monitoring/setup-monitoring.sh
 
-# Access Grafana
 kubectl port-forward -n monitoring svc/prom-stack-grafana 3000:80
-# Open http://localhost:3000 — login: admin / admin
+# http://localhost:3000 — admin / admin
 ```
 
-### Failover captured live in Grafana
+If `kubectl get podmonitor -A` returns nothing after install, restart the CNPG operator so it re-creates the PodMonitor:
 
-The dashboard (time range: Last 15 minutes, refresh: 5s) shows the full failover sequence in real time while running a chaos test:
+```bash
+kubectl rollout restart deployment -n cnpg-system cnpg-controller-manager
+```
 
-![Grafana — failover mid-flight, replication degraded](docs/screenshots/grafana-failover-mid-flight.png)
+### Apply alerting + error budget rules
 
-*Health transitions to "Replication Degraded", TPS spikes from the write loop, new primary appears with start time "a few seconds ago".*
+```bash
+kubectl apply -f monitoring/cnpg-prometheusrule.yaml
+```
 
-![Grafana — cluster fully recovered](docs/screenshots/grafana-cluster-healthy.png)
+### Import the SLO dashboard
 
-*All three pods Up, Clustering: Yes, replication lag 0s — cluster fully recovered after failover.*
+In Grafana: **Dashboards → New → Import** → upload `monitoring/cnpg-slo-dashboard.json` → select Prometheus datasource.
 
-### Key metrics tracked
+---
 
-| Metric | What it shows |
+## Prometheus alerts
+
+Defined in `monitoring/cnpg-prometheusrule.yaml` across three rule groups:
+
+**`cnpg.failover` — operational alerts**
+
+| Alert | Expression | Severity | Fires when |
+|---|---|---|---|
+| `CNPGInstanceDown` | `count(cnpg_collector_up == 1) < 3` | critical | fewer than 3 pods healthy for > 10s |
+| `CNPGReplicationLagHigh` | `cnpg_pg_replication_lag > 5` | warning | any replica > 5s behind for > 20s |
+| `CNPGWriteLagHigh` | `cnpg_pg_stat_replication_write_lag_seconds > 2` | warning | write lag > 2s for > 20s |
+
+**`cnpg.slo` — recording rules**
+
+Pre-computed metrics stored every 30s for efficient dashboard queries:
+
+| Metric | What it tracks |
 |---|---|
-| `cnpg_collector_up` | Whether each pod's metrics exporter is reachable |
-| `cnpg_pg_replication_lag` | Streaming replication delay per replica |
-| TPS | Live transaction throughput — shows write outage window during failover |
-| Connections | Per-pod active connections — step change visible at moment of kill |
-| Wraparound | Transaction ID exhaustion risk — should stay below 10% |
+| `cnpg:availability_ratio:30d` | Availability fraction over 30 days |
+| `cnpg:availability_ratio:1h` | Availability fraction over 1 hour |
+| `cnpg:error_budget_remaining:percent` | % of monthly budget remaining |
+| `cnpg:error_budget_burn_rate:1h` | Rate of budget consumption vs sustainable pace |
+
+**`cnpg.error_budget` — budget alerts**
+
+| Alert | Threshold | Severity | Meaning |
+|---|---|---|---|
+| `CNPGErrorBudgetFastBurn` | burn rate > 14.4x | critical | budget exhausted in ~2 hours |
+| `CNPGErrorBudgetSlowBurn` | burn rate > 3x | warning | budget exhausted in ~10 days |
+| `CNPGErrorBudgetLow` | budget < 10% | warning | < 4.3 minutes remaining |
+| `CNPGErrorBudgetExhausted` | budget ≤ 0% | critical | 99.9% SLO breached |
+
+---
+
+## SLO & Error Budget dashboard
+
+Custom Grafana dashboard (`monitoring/cnpg-slo-dashboard.json`) with 10 panels:
+
+| Panel | Shows |
+|---|---|
+| Error budget gauge | % remaining — drops during failovers, recovers over time |
+| Burn rate stat | Current rate — green < 3x, orange 3–14.4x, red > 14.4x |
+| 30-day availability | Actual SLI vs 99.9% target |
+| Failovers remaining | How many more unplanned failovers before SLO breach (~86 at start) |
+| Budget consumed | Seconds spent from the 2592s monthly allowance |
+| Max failovers bar gauge | Visual countdown from 86 to 0 |
+| Budget over time | Timeline showing budget dropping with each chaos test |
+| Burn rate over time | Timeline with slow/fast burn threshold lines |
+| Replication lag | Per-pod streaming replication delay |
+| Instance availability | Per-pod up/down timeline — shows exact failover moments |
+
+---
+
+## How failover time is measured
+
+```bash
+T_KILL=$(date +%s%3N)       # milliseconds at pod delete
+# ... wait for primary label ...
+T_ELECTED=$(date +%s%3N)    # milliseconds when new primary label appears
+FAILOVER_MS=$(( T_ELECTED - T_KILL ))
+```
+
+Includes: Kubernetes pod deletion processing + CNPG loss detection + replica promotion + pod label update. Does not include: killed pod restarting as a replica (that takes ~30s and is what the error budget tracks as downtime).
 
 ---
 
@@ -232,26 +287,26 @@ kubectl get pod \
   -o jsonpath='{.items[0].metadata.name}'
 ```
 
-This works correctly after any number of failovers without modification.
+Works correctly after any number of failovers without modification.
 
 ---
 
 ## Password handling
 
-CNPG uses `scram-sha-256` auth even for `127.0.0.1` connections inside the pod. Both scripts fetch the password from the cluster secret at runtime:
+CNPG uses `scram-sha-256` auth even for `127.0.0.1` connections. Both scripts fetch the password from the cluster secret at runtime:
 
 ```bash
 DB_PASS=$(kubectl get secret my-pg-cluster-app \
   -o jsonpath='{.data.password}' | base64 --decode)
 ```
 
-Passed into the pod via `env PGPASSWORD=` on each `kubectl exec` — no `.pgpass` file, no manual export.
+Passed via `env PGPASSWORD=` on each `kubectl exec` — no `.pgpass` file, no manual export.
 
 ---
 
 ## Notes
 
-- The replication check in `cnpg-chaos-test.sh` waits 1 second before reading from replicas to account for streaming replication lag on Minikube. With less than 60s between back-to-back runs, a replica that just rejoined may still be catching up — increase the sleep between runs if you see intermittent replica failures.
-- Each `cnpg-write-failover.sh` run drops and recreates `write_failover_test` so results never bleed between runs.
-- Failover time is measured from `kubectl delete pod` to the moment a pod acquires the `primary` role label — wall-clock time including Kubernetes pod scheduling and CNPG promotion logic.
-- If `kubectl get podmonitor -A` returns nothing after installing the monitoring stack, restart the CNPG operator: `kubectl rollout restart deployment -n cnpg-system cnpg-controller-manager`. The PodMonitor is only created on operator startup if the Prometheus CRDs already exist.
+- Replication check waits 1s before reading replicas. With < 60s between back-to-back runs a freshly rejoined replica may still be catching up — increase sleep if you see intermittent failures.
+- Each `cnpg-write-failover.sh` run drops and recreates `write_failover_test` — results never bleed between runs.
+- Error budget recording rules need ~2 minutes of scrape history before they return values. If `cnpg:error_budget_remaining:percent` returns empty, wait and retry.
+- The `< 3` threshold in `CNPGInstanceDown` assumes exactly 3 active series. After failovers, Prometheus may briefly show stale series from old pod IPs — if the alert fires spuriously while all pods are healthy, wait 5 minutes for stale series to expire.

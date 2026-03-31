@@ -1,0 +1,373 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "title": "CNPG SLO & Error Budget",
+  "uid": "cnpg-slo-budget",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Error budget remaining",
+      "description": "SLO: 99.9% availability. Budget = 43.2 minutes downtime per 30 days. Drops during failovers, recovers as time passes.",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 10,   "color": "orange" },
+              { "value": 50,   "color": "yellow" },
+              { "value": 80,   "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": true,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg:error_budget_remaining:percent",
+          "legendFormat": "Budget remaining %"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "title": "Burn rate (1h window)",
+      "description": "1.0 = sustainable. >3 = slow burn. >14.4 = fast burn (exhausts budget in 2 hours).",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null,  "color": "green" },
+              { "value": 3,     "color": "orange" },
+              { "value": 14.4,  "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "value_and_name",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg:error_budget_burn_rate:1h",
+          "legendFormat": "Burn rate"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "title": "30-day availability",
+      "description": "SLO target: 99.9%",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 4, "w": 6, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null,  "color": "red" },
+              { "value": 0.999, "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg:availability_ratio:30d",
+          "legendFormat": "Availability"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "Failovers allowed this month",
+      "description": "How many more unplanned failovers you can have before breaching the 99.9% SLO. Based on ~30s downtime per failover and 43.2 min monthly budget.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 10,   "color": "orange" },
+              { "value": 30,   "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "clamp_min((cnpg:error_budget_remaining:percent / 100) * (2592 / 30), 0)",
+          "legendFormat": "Failovers remaining"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "title": "Budget consumed (seconds)",
+      "description": "Seconds of downtime consumed from the 2592s (43.2 min) monthly budget.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 4, "w": 6, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null,  "color": "green" },
+              { "value": 1296,  "color": "orange" },
+              { "value": 2332,  "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "clamp_min((1 - (cnpg:error_budget_remaining:percent / 100)) * 2592, 0)",
+          "legendFormat": "Budget consumed"
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "title": "Max failovers before SLO breach",
+      "description": "Total allowed per month at ~30s downtime per failover. Red = exceeded, orange = < 10 remaining, green = healthy.",
+      "type": "bargauge",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 86,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 10,   "color": "orange" },
+              { "value": 30,   "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "vertical",
+        "displayMode": "gradient",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "clamp_min((cnpg:error_budget_remaining:percent / 100) * (2592 / 30), 0)",
+          "legendFormat": "Remaining failovers"
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "title": "Error budget remaining over time",
+      "description": "Drops during chaos tests, recovers as time passes. Flat line = no incidents.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 10,   "color": "orange" },
+              { "value": 50,   "color": "green" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "single" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg:error_budget_remaining:percent",
+          "legendFormat": "Budget remaining %"
+        }
+      ]
+    },
+
+    {
+      "id": 8,
+      "title": "Burn rate over time",
+      "description": "Orange threshold = slow burn (3x). Red threshold = fast burn (14.4x).",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null,  "color": "green" },
+              { "value": 3,     "color": "orange" },
+              { "value": 14.4,  "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "single" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg:error_budget_burn_rate:1h",
+          "legendFormat": "Burn rate (1h)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vector(14.4)",
+          "legendFormat": "Fast burn threshold"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vector(3)",
+          "legendFormat": "Slow burn threshold"
+        }
+      ]
+    },
+
+    {
+      "id": 9,
+      "title": "Replication lag",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 5,    "color": "red" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg_pg_replication_lag{cluster=\"my-pg-cluster\"}",
+          "legendFormat": "{{ pod }}"
+        }
+      ]
+    },
+
+    {
+      "id": 10,
+      "title": "Instance availability",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 20 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1,    "color": "green" }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "cnpg_collector_up{cluster=\"my-pg-cluster\"}",
+          "legendFormat": "{{ pod }}"
+        }
+      ]
+    }
+  ],
+
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "label": "Datasource"
+      }
+    ]
+  }
+}
