@@ -15,7 +15,7 @@ spec:
           expr: |
             count by (cluster) (
               cnpg_collector_up{cluster="my-pg-cluster"} == 1
-            ) < 4
+            ) < 3
           for: 10s
           labels:
             severity: critical
